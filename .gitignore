@@ -1,0 +1,56 @@
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+*.lo
+*.la
+.config
+.deps/
+build/
+wpa_supplicant/wpa_supplicant
+wpa_supplicant/wpa_cli
+wpa_supplicant/wpa_passphrase
+wpa_supplicant/eapol_test
+wpa_supplicant/preauth_test
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Capture / runtime output
+*.pcap
+*.pcapng
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local secrets
+*.pem
+*.key
+*.token
+.env
+.env.local
+secrets/
