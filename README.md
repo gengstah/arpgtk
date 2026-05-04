@@ -211,6 +211,8 @@ sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \
 | --- | --- | --- |
 | `--pn-offset N` | `4` | PNs above the AP's last sniffed broadcast PN to send the probe at. Bump if receivers reject the frame as a replay. Doubles as a minimum PN when the sample window finds no AP broadcasts. Accepts hex (`0x...`). |
 | `--pn-sample-window SEC` | `1.5` | Seconds to sniff AP broadcasts before injecting the probe, used to learn the AP's current PN. If no broadcasts arrive in this window, fall back to a safe-high default PN. |
+| `--probe-count N` | `1` | Number of probe injections to send. Default is single-shot. Bump to `10` or more against power-save targets (iPhones, recent Android) where a single frame may land during an RX-off window. Each probe uses a unique sequential PN. |
+| `--probe-interval SEC` | `0.1` | Seconds between successive probe injections when `--probe-count > 1`. Pick a value shorter than the target's typical PSM sleep cycle (~100-300ms for phones). |
 | `--pcap PATH` | off | Write sniffed monitor-iface frames + the injected probe to `PATH` (link-type 127, IEEE802_11_RADIOTAP). The pcap sniffer is started before the supplicant runs, so the EAPOL 4-way handshake lands in the file too. Wireshark can then derive PTK/GTK from a `wpa-pwd:<psk>:<ssid>` decryption key and decrypt every protected frame in the capture. |
 
 ## Exit codes
@@ -227,7 +229,7 @@ sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \
 
 When `--verify` reports no reply and you suspect the network is exposed, work down this list:
 
-1. **Wake the target** if it's a phone or a laptop in suspend. iOS and recent Android put the Wi-Fi NIC into power-save when the screen is off and miss our single-shot injection.
+1. **Wake the target** if it's a phone or a laptop in suspend. iOS and recent Android put the Wi-Fi NIC into power-save when the screen is off and miss our single-shot injection. iPhones cycle PSM even when unlocked; for those, also pass `--probe-count 10 --probe-interval 0.1` so multiple frames land across the PSM wake windows.
 2. **Pin the requestor IP** with `--probe-src-ip <gateway-ip>`. Strict stacks (iOS, recent Android, locked-down embedded) drop ARP requests whose `psrc` isn't in the receiving subnet.
 3. **Raise `--pn-offset`**. On a busy AP that's been up for a long time, the AP's broadcast PN can be well above `0x100000`. Try `--pn-offset 0x1000000` or higher; accepts hex.
 4. **Capture with `--pcap`** and open in Wireshark. The EAPOL 4-way handshake is included in the file (the sniffer starts before the supplicant), so Edit → Preferences → Protocols → IEEE 802.11 → Decryption keys, add `wpa-pwd:<psk>:<ssid>` and Wireshark will derive the GTK and decrypt the protected frames. Look for:
