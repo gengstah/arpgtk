@@ -211,7 +211,7 @@ sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \
 | --- | --- | --- |
 | `--pn-offset N` | `4` | PNs above the AP's last sniffed broadcast PN to send the probe at. Bump if receivers reject the frame as a replay. Doubles as a minimum PN when the sample window finds no AP broadcasts. Accepts hex (`0x...`). |
 | `--pn-sample-window SEC` | `1.5` | Seconds to sniff AP broadcasts before injecting the probe, used to learn the AP's current PN. If no broadcasts arrive in this window, fall back to a safe-high default PN. |
-| `--pcap PATH` | off | Write sniffed monitor-iface frames + the injected probe to `PATH` (link-type 127, IEEE802_11_RADIOTAP). For offline analysis when `--verify` reports no reply. |
+| `--pcap PATH` | off | Write sniffed monitor-iface frames + the injected probe to `PATH` (link-type 127, IEEE802_11_RADIOTAP). The pcap sniffer is started before the supplicant runs, so the EAPOL 4-way handshake lands in the file too. Wireshark can then derive PTK/GTK from a `wpa-pwd:<psk>:<ssid>` decryption key and decrypt every protected frame in the capture. |
 
 ## Exit codes
 
@@ -230,7 +230,7 @@ When `--verify` reports no reply and you suspect the network is exposed, work do
 1. **Wake the target** if it's a phone or a laptop in suspend. iOS and recent Android put the Wi-Fi NIC into power-save when the screen is off and miss our single-shot injection.
 2. **Pin the requestor IP** with `--probe-src-ip <gateway-ip>`. Strict stacks (iOS, recent Android, locked-down embedded) drop ARP requests whose `psrc` isn't in the receiving subnet.
 3. **Raise `--pn-offset`**. On a busy AP that's been up for a long time, the AP's broadcast PN can be well above `0x100000`. Try `--pn-offset 0x1000000` or higher; accepts hex.
-4. **Capture with `--pcap`** and open in Wireshark with the GTK loaded (Edit → Preferences → Protocols → IEEE 802.11 → Decryption keys, add `wpa-pwd:<psk>:<ssid>` or `wpa-psk:<32-byte-hex>`). Look for:
+4. **Capture with `--pcap`** and open in Wireshark. The EAPOL 4-way handshake is included in the file (the sniffer starts before the supplicant), so Edit → Preferences → Protocols → IEEE 802.11 → Decryption keys, add `wpa-pwd:<psk>:<ssid>` and Wireshark will derive the GTK and decrypt the protected frames. Look for:
    - AP broadcasts on our `keyid` during the sample window (proves the AP is using a shared GTK at all).
    - Our injected frame visible on the air with a CCMP MIC that Wireshark accepts under the loaded GTK.
    - Any reply from the target (it will appear on the bridged path through the AP, not the monitor capture, so check the managed iface separately if needed).

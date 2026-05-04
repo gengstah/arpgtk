@@ -240,32 +240,6 @@ def do_check_gtk_shared(args, *, iface_a: str, chk_iface: str,
 _SAFE_HIGH_PN = 0x100000
 
 
-def _sample_ap_pn(*, mon_iface: str, ap_mac: str, gtk_idx: int,
-                  window: float, pcap=None) -> int | None:
-    """Briefly sniff the monitor iface for AP broadcasts on our keyid;
-    return the highest PN seen, or None if no broadcasts arrived. If
-    `pcap` is a LockedPcapWriter, all received frames are tee'd into it.
-    """
-    from arpgtk_core.sniffer import GtkSniffer, ReflectionFilter
-
-    state = {"gtk": b"\x00" * 16, "gtk_idx": gtk_idx, "ap_pn_seen": 0}
-    state_lock = threading.Lock()
-    sniffer = GtkSniffer(
-        mon_iface=mon_iface, ap_mac=ap_mac,
-        state=state, state_lock=state_lock,
-        reflection=ReflectionFilter(),
-        pcap=pcap,
-        log=lambda *_: None,
-    )
-    sniffer.start()
-    try:
-        time.sleep(window)
-    finally:
-        sniffer.stop()
-    with state_lock:
-        return state["ap_pn_seen"] or None
-
-
 _MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
 
 
@@ -298,7 +272,8 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
     from arpgtk_core.iface import (detect_and_align_channel, get_iface_mac,
                                    setup_monitor, teardown_vif)
     from arpgtk_core.session import GtkSession, SupplicantConfig
-    from arpgtk_core.sniffer import LockedPcapWriter
+    from arpgtk_core.sniffer import (GtkSniffer, LockedPcapWriter,
+                                     ReflectionFilter)
 
     cfg = SupplicantConfig(
         iface=args.iface, ssid=args.ssid, key_mgmt=args.key_mgmt,
@@ -306,6 +281,36 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
         scan_freq=args.scan_freq, bssid=args.bssid,
         ieee80211w=args.ieee80211w,
     )
+
+    # Set up the monitor iface BEFORE the supplicant runs, so the EAPOL
+    # 4-way handshake gets captured into --pcap (Wireshark needs the
+    # handshake in the same file to derive PTK/GTK).
+    try:
+        we_created_mon = setup_monitor(args.iface, mon_iface)
+    except IfaceError as e:
+        fatal(str(e))
+    atexit_state["we_created_mon"] = we_created_mon
+
+    pcap_writer = None
+    if args.pcap:
+        # link_type=127 = LINKTYPE_IEEE802_11_RADIOTAP.
+        pcap_writer = LockedPcapWriter(args.pcap, link_type=127)
+        print(f"[+] PCAP: writing to {args.pcap}")
+
+    # Pre-create the sniffer with placeholder ap_mac / gtk_idx; it tees
+    # every received frame into the pcap unconditionally, so the EAPOL
+    # handshake about to fire on this phy lands in the file. We update
+    # the filter values once association completes.
+    sniff_state = {"gtk": b"\x00" * 16, "gtk_idx": 0, "ap_pn_seen": 0}
+    sniff_lock = threading.Lock()
+    sniffer = GtkSniffer(
+        mon_iface=mon_iface, ap_mac="ff:ff:ff:ff:ff:ff",
+        state=sniff_state, state_lock=sniff_lock,
+        reflection=ReflectionFilter(),
+        pcap=pcap_writer,
+        log=lambda *_: None,
+    )
+    sniffer.start()
 
     try:
         with GtkSession(cfg, args.wpa_supplicant,
@@ -316,27 +321,23 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
             print(f"[+] Associated: BSSID={keys.bssid}, "
                   f"GTK idx={keys.gtk_idx}, our MAC={our_mac}")
 
-            we_created_mon = setup_monitor(args.iface, mon_iface)
-            atexit_state["we_created_mon"] = we_created_mon
+            # Now point the sniffer at the actual AP and key id, and
+            # discard whatever it counted before association.
+            sniffer.update_ap_mac(keys.bssid)
+            with sniff_lock:
+                sniff_state["gtk_idx"] = keys.gtk_idx
+                sniff_state["ap_pn_seen"] = 0
+
             channel = detect_and_align_channel(args.iface, mon_iface,
                                                log=print)
             print(f"[+] Monitor iface {mon_iface} on channel {channel} "
                   f"({'auto-created' if we_created_mon else 'reusing'}).")
 
-            pcap_writer = None
-            if args.pcap:
-                # link_type=127 = LINKTYPE_IEEE802_11_RADIOTAP. Monitor
-                # captures ship with a RadioTap header by default.
-                pcap_writer = LockedPcapWriter(args.pcap, link_type=127)
-                print(f"[+] PCAP: writing to {args.pcap}")
-
             print(f"[+] Sampling AP broadcast PN on keyid={keys.gtk_idx} "
                   f"for {args.pn_sample_window:.1f}s...")
-            ap_pn = _sample_ap_pn(
-                mon_iface=mon_iface, ap_mac=keys.bssid,
-                gtk_idx=keys.gtk_idx, window=args.pn_sample_window,
-                pcap=pcap_writer,
-            )
+            time.sleep(args.pn_sample_window)
+            with sniff_lock:
+                ap_pn = sniff_state["ap_pn_seen"] or None
             if ap_pn is None:
                 probe_pn = max(_SAFE_HIGH_PN, args.pn_offset)
                 print(f"[+] No AP broadcasts seen; using fallback "
@@ -465,16 +466,18 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                 return 0
             finally:
                 watcher.stop()
-                if pcap_writer is not None:
-                    pcap_writer.close()
-                if we_created_mon:
-                    teardown_vif(mon_iface)
-                    atexit_state["we_created_mon"] = False
-                    print(f"[+] Tore down {mon_iface}")
-                else:
-                    print(f"[+] Leaving pre-existing {mon_iface} alone")
     except (SupplicantError, IfaceError) as e:
         fatal(str(e))
+    finally:
+        sniffer.stop()
+        if pcap_writer is not None:
+            pcap_writer.close()
+        if we_created_mon:
+            teardown_vif(mon_iface)
+            atexit_state["we_created_mon"] = False
+            print(f"[+] Tore down {mon_iface}")
+        else:
+            print(f"[+] Leaving pre-existing {mon_iface} alone")
 
 
 # --- main --------------------------------------------------------------------
