@@ -211,6 +211,7 @@ sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \
 | --- | --- | --- |
 | `--pn-offset N` | `4` | PNs above the AP's last sniffed broadcast PN to send the probe at. Bump if receivers reject the frame as a replay. Doubles as a minimum PN when the sample window finds no AP broadcasts. Accepts hex (`0x...`). |
 | `--pn-sample-window SEC` | `1.5` | Seconds to sniff AP broadcasts before injecting the probe, used to learn the AP's current PN. If no broadcasts arrive in this window, fall back to a safe-high default PN. |
+| `--pcap PATH` | off | Write sniffed monitor-iface frames + the injected probe to `PATH` (link-type 127, IEEE802_11_RADIOTAP). For offline analysis when `--verify` reports no reply. |
 
 ## Exit codes
 
@@ -221,6 +222,20 @@ sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \
 | `2` | `--check-gtk-shared`: GTK randomized (mitigated). `--verify`: no reply (probably mitigated, but read the output). |
 | `3` | Inconclusive (BSSID mismatch, supplicant timeout, etc). |
 | `130` | User cancelled (Ctrl-C). |
+
+## Diagnosing a "no reply" verdict
+
+When `--verify` reports no reply and you suspect the network is exposed, work down this list:
+
+1. **Wake the target** if it's a phone or a laptop in suspend. iOS and recent Android put the Wi-Fi NIC into power-save when the screen is off and miss our single-shot injection.
+2. **Pin the requestor IP** with `--probe-src-ip <gateway-ip>`. Strict stacks (iOS, recent Android, locked-down embedded) drop ARP requests whose `psrc` isn't in the receiving subnet.
+3. **Raise `--pn-offset`**. On a busy AP that's been up for a long time, the AP's broadcast PN can be well above `0x100000`. Try `--pn-offset 0x1000000` or higher; accepts hex.
+4. **Capture with `--pcap`** and open in Wireshark with the GTK loaded (Edit → Preferences → Protocols → IEEE 802.11 → Decryption keys, add `wpa-pwd:<psk>:<ssid>` or `wpa-psk:<32-byte-hex>`). Look for:
+   - AP broadcasts on our `keyid` during the sample window (proves the AP is using a shared GTK at all).
+   - Our injected frame visible on the air with a CCMP MIC that Wireshark accepts under the loaded GTK.
+   - Any reply from the target (it will appear on the bridged path through the AP, not the monitor capture, so check the managed iface separately if needed).
+5. **Run `--check-gtk-shared`** with a second card. If the verdict is `RANDOMIZED`, the network has per-client GTK and the primitive is mitigated. No further work helps until you find a different test target.
+6. **Try a Linux victim instead.** Linux's ARP stack is permissive (replies regardless of `psrc` subnet, no PSM games). A Linux victim's reply or non-reply gives a much cleaner signal than an iPhone.
 
 ## Cleanup
 

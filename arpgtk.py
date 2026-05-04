@@ -138,6 +138,15 @@ def parse_args() -> argparse.Namespace:
                         "the probe, used to learn the AP's current PN. "
                         "Default 1.5. If no AP broadcasts arrive in this "
                         "window we fall back to a safe-high default PN.")
+    g.add_argument("--pcap",
+                   help="Path to a pcap file. Frames received on the "
+                        "monitor iface during the sample window plus the "
+                        "injected probe are written here for offline "
+                        "analysis. Useful when --verify reports no reply: "
+                        "open in Wireshark with the captured GTK and "
+                        "check whether the AP is broadcasting on our "
+                        "keyid, whether our frame went out, and whether "
+                        "the receiver is MIC-failing.")
     return p.parse_args()
 
 
@@ -232,9 +241,11 @@ _SAFE_HIGH_PN = 0x100000
 
 
 def _sample_ap_pn(*, mon_iface: str, ap_mac: str, gtk_idx: int,
-                  window: float) -> int | None:
+                  window: float, pcap=None) -> int | None:
     """Briefly sniff the monitor iface for AP broadcasts on our keyid;
-    return the highest PN seen, or None if no broadcasts arrived."""
+    return the highest PN seen, or None if no broadcasts arrived. If
+    `pcap` is a LockedPcapWriter, all received frames are tee'd into it.
+    """
     from arpgtk_core.sniffer import GtkSniffer, ReflectionFilter
 
     state = {"gtk": b"\x00" * 16, "gtk_idx": gtk_idx, "ap_pn_seen": 0}
@@ -243,6 +254,7 @@ def _sample_ap_pn(*, mon_iface: str, ap_mac: str, gtk_idx: int,
         mon_iface=mon_iface, ap_mac=ap_mac,
         state=state, state_lock=state_lock,
         reflection=ReflectionFilter(),
+        pcap=pcap,
         log=lambda *_: None,
     )
     sniffer.start()
@@ -276,7 +288,7 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
         except ValueError:
             fatal(f"--probe-src-ip {args.probe_src_ip!r} is not a valid IP.")
 
-    from scapy.all import sendp
+    from scapy.all import RadioTap, sendp
     from scapy.layers.l2 import ARP
 
     from arpgtk_core.errors import IfaceError, SupplicantError
@@ -286,6 +298,7 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
     from arpgtk_core.iface import (detect_and_align_channel, get_iface_mac,
                                    setup_monitor, teardown_vif)
     from arpgtk_core.session import GtkSession, SupplicantConfig
+    from arpgtk_core.sniffer import LockedPcapWriter
 
     cfg = SupplicantConfig(
         iface=args.iface, ssid=args.ssid, key_mgmt=args.key_mgmt,
@@ -310,11 +323,19 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
             print(f"[+] Monitor iface {mon_iface} on channel {channel} "
                   f"({'auto-created' if we_created_mon else 'reusing'}).")
 
+            pcap_writer = None
+            if args.pcap:
+                # link_type=127 = LINKTYPE_IEEE802_11_RADIOTAP. Monitor
+                # captures ship with a RadioTap header by default.
+                pcap_writer = LockedPcapWriter(args.pcap, link_type=127)
+                print(f"[+] PCAP: writing to {args.pcap}")
+
             print(f"[+] Sampling AP broadcast PN on keyid={keys.gtk_idx} "
                   f"for {args.pn_sample_window:.1f}s...")
             ap_pn = _sample_ap_pn(
                 mon_iface=mon_iface, ap_mac=keys.bssid,
                 gtk_idx=keys.gtk_idx, window=args.pn_sample_window,
+                pcap=pcap_writer,
             )
             if ap_pn is None:
                 probe_pn = max(_SAFE_HIGH_PN, args.pn_offset)
@@ -353,7 +374,12 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                                                gtk_idx=keys.gtk_idx)
 
                 print(f"[+] Probing {args.target_ip} from {probe_src}...")
-                sendp(frame, iface=mon_iface, verbose=False)
+                # Wrap with RadioTap so what's transmitted matches what
+                # we save to pcap (the sniffer's RX frames also have one).
+                tx = RadioTap() / frame
+                sendp(tx, iface=mon_iface, verbose=False)
+                if pcap_writer is not None:
+                    pcap_writer.write(tx)
 
                 reply = watcher.wait_for_reply(args.target_ip, timeout=2.5)
                 print()
@@ -439,6 +465,8 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                 return 0
             finally:
                 watcher.stop()
+                if pcap_writer is not None:
+                    pcap_writer.close()
                 if we_created_mon:
                     teardown_vif(mon_iface)
                     atexit_state["we_created_mon"] = False
