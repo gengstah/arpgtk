@@ -155,11 +155,23 @@ class GtkSniffer:
                 return
 
             keyid = get_ccmp_keyid(frame)
+            pn = dot11ccmp_get_pn(frame[Dot11CCMP])
             with self.state_lock:
-                if keyid != self.state["gtk_idx"]:
-                    return
-                pn = dot11ccmp_get_pn(frame[Dot11CCMP])
                 if self.reflection.is_ours(pn):
+                    return
+                # Track the AP's broadcast PN per-keyid, regardless of
+                # whether it matches our current gtk_idx. Lets the
+                # caller floor injections against the AP's actual
+                # activity even when the AP rotated keys and our
+                # captured keyid is no longer the one in active use.
+                pn_by_keyid = self.state.setdefault("ap_pn_by_keyid", {})
+                if pn > pn_by_keyid.get(keyid, 0):
+                    pn_by_keyid[keyid] = pn
+
+                if keyid != self.state["gtk_idx"]:
+                    # Different keyid: PN tracked above; skip our-keyid
+                    # ap_pn_seen update and skip the ambient decrypt
+                    # cross-check (we don't have the right GTK for it).
                     return
                 if pn > self.state["ap_pn_seen"]:
                     self.state["ap_pn_seen"] = pn

