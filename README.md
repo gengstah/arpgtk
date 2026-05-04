@@ -155,6 +155,8 @@ because the probe doesn't cross the bridge.
 
 By default arpgtk learns the victim's MAC from the reply (auto-discovery). If you already know the MAC, pass it via `--target-mac` to skip that step. arpgtk cross-checks the asserted MAC against the reply's hwsrc and warns if another host owns this IP on the network.
 
+If your target is an iPhone, recent Android, or other strict-stack device that won't reply to ARP requests with off-subnet `psrc`, override the link-local default with `--probe-src-ip <ip-in-target-subnet>` (typically the gateway). The trade-off is a brief `(probe-src-ip, our-mac)` cache entry on the target while it processes the request.
+
 ```
 sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \
     --verify --target-ip 192.168.1.50 --target-mac aa:bb:cc:dd:ee:50
@@ -201,6 +203,7 @@ sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \
 | `--verify` | off | Probe-and-reply against `--target-ip`. |
 | `--target-ip IP` | _(none)_ | Victim IP for `--verify`. |
 | `--target-mac MAC` | auto-discover from reply | Skip learning the victim's MAC from the reply by passing it directly. Also cross-checked against the reply's hwsrc. |
+| `--probe-src-ip IP` | random `169.254.x.x` link-local | Override the requestor IP in the verify probe. Pass an IP in the target's subnet (e.g. the gateway) for stricter stacks (iOS, recent Android) that drop ARP requests with off-subnet psrc. |
 
 ### Verify probe tuning
 
