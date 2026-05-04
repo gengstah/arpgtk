@@ -161,7 +161,30 @@ def setup_managed_vif(phy_iface: str, vif_name: str) -> bool:
             f"phy; check `iw phy $(cat /sys/class/net/{phy_iface}/phy80211/"
             "name) info` for valid interface combinations. Workaround: "
             "pass --chk-iface pointing at a separate physical NIC.") from e
-    subprocess.check_call(["ip", "link", "set", vif_name, "up"])
+    # Some drivers (rt2800usb, most Realtek/Intel chipsets) accept the
+    # `iw add` with exit 0 but never actually register the new netdev,
+    # because their valid-interface-combinations table doesn't allow
+    # concurrent managed vifs on a single phy. Catch that gap here and
+    # raise the same IfaceError instead of letting the next `ip link
+    # set` die on "Cannot find device".
+    if not iface_exists(vif_name):
+        raise IfaceError(
+            f"`iw add {vif_name}` succeeded but the netdev never "
+            f"appeared. The driver on phy {phy_iface} does not support "
+            "multiple concurrent managed virtual interfaces on a single "
+            "phy (rt2800usb, most Realtek RTLxxx and Intel iwlwifi "
+            "behave this way). Confirm with "
+            f"`iw phy $(cat /sys/class/net/{phy_iface}/phy80211/name) "
+            "info | grep -A5 'valid interface combinations'`. Workaround: "
+            "use a second physical NIC and pass --chk-iface <its_name>.")
+    try:
+        subprocess.check_call(["ip", "link", "set", vif_name, "up"])
+    except subprocess.CalledProcessError as e:
+        raise IfaceError(
+            f"`iw add {vif_name}` succeeded but `ip link set {vif_name} "
+            f"up` failed: {e}. The driver may have registered a stub "
+            "netdev that can't be brought up. Workaround: use a second "
+            "physical NIC and pass --chk-iface <its_name>.") from e
     return True
 
 
