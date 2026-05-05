@@ -2,7 +2,7 @@
 """
 arpgtk: audit tool for ARP-over-GTK injection exposure.
 
-Two modes:
+Three modes:
 
   --check-gtk-shared (default)
       Associate twice on two virtual managed interfaces; byte-compare
@@ -18,12 +18,22 @@ Two modes:
       iface for the bridged unicast ARP reply. Reply seen => the
       primitive is viable against this target.
 
+  --arp-defense --spoof-ip IP
+      Detects bridge-side ARP filters (DAI / IP-MAC binding / client
+      isolation). Sends a forged broadcast ARP via the managed iface
+      and watches the monitor for the AP rebroadcasting it. Prints
+      '1' on stdout if the bridge dropped the frame (defense present)
+      or '0' if it forwarded it (no defense). Workflow gate: 0 =>
+      arpspoof works, 1 => reach for an ARP-over-GTK injector.
+
 USE ONLY ON NETWORKS YOU OWN OR ARE EXPLICITLY AUTHORIZED TO TEST.
 
 Examples:
     sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass
     sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \\
         --verify --target-ip 192.168.1.50
+    sudo ./arpgtk.py --iface wlan0 --ssid mynet --psk mypass \\
+        --arp-defense --spoof-ip 192.168.1.1
 """
 
 from __future__ import annotations
@@ -109,6 +119,20 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--verify", action="store_true",
                    help="Live probe-and-reply against --target-ip. Default "
                         "is --check-gtk-shared.")
+    g.add_argument("--arp-defense", action="store_true",
+                   help="Detect bridge-side ARP defenses (DAI / IP-MAC "
+                        "binding / client isolation / similar). Associates "
+                        "as a normal client, sends a forged broadcast ARP "
+                        "via the managed iface, and watches the monitor "
+                        "for the AP rebroadcasting it. Prints '1' to "
+                        "stdout if the bridge filtered the probe (defense "
+                        "present), '0' if it rebroadcast it (no defense). "
+                        "Requires --spoof-ip. Useful as a workflow gate: "
+                        "0 -> arpspoof works; 1 -> reach for airspoof.")
+    g.add_argument("--spoof-ip",
+                   help="In-subnet IP to forge as the source of the "
+                        "--arp-defense probe. Pick the gateway IP for the "
+                        "most realistic poison-attempt test.")
     g.add_argument("--target-ip",
                    help="Victim IP for --verify. Required when --verify is set.")
     g.add_argument("--target-mac",
@@ -166,7 +190,7 @@ def fatal(msg: str) -> None:
     sys.exit(1)
 
 
-# --- the two modes -----------------------------------------------------------
+# --- the modes ---------------------------------------------------------------
 
 def do_check_gtk_shared(args, *, iface_a: str, chk_iface: str,
                        atexit_state: dict) -> str:
@@ -252,6 +276,212 @@ _SAFE_HIGH_PN = 0x100000
 
 
 _MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
+
+
+_ETH_P_ARP = 0x0806
+_PACKET_OUTGOING = 4
+
+
+def do_arp_defense(args, *, mon_iface: str, atexit_state: dict) -> int:
+    """Detect bridge-side ARP filtering. Stdout is the binary verdict
+    only ('0' or '1'); progress goes to stderr so the caller can capture
+    `arpgtk --arp-defense ...` straight into a shell variable.
+
+    Reliability: two independent listeners watch for the AP's
+    rebroadcast of our forged ARP, and EITHER hit means "no defense":
+
+      Path A -- managed-iface AF_PACKET listener (kernel side).
+        After the AP rebroadcasts the frame, our STA's kernel decrypts
+        it under whatever key the AP encrypted our copy with. We see
+        plaintext ARP via AF_PACKET. This works equally for shared and
+        per-client GTK -- the kernel doesn't care which key the AP
+        used as long as it's our key. The PACKET_OUTGOING filter
+        excludes our own TX so we don't self-trigger.
+
+      Path B -- monitor-iface CCMP-decrypt listener.
+        Decrypts AP from-DS broadcasts under our captured GTK and
+        looks for the inner ARP marker. Catches the case where the AP
+        forwards to other STAs but doesn't loop the broadcast back to
+        the source. Only fires when the GTK is shared (per-client GTK
+        MIC-fails here -- but Path A then carries the verdict).
+
+    A defense verdict (1) requires BOTH paths to miss. So per-client
+    GTK alone no longer trips a false positive."""
+    if not args.spoof_ip:
+        fatal("--arp-defense requires --spoof-ip "
+              "(an in-subnet IP to forge as the probe's source).")
+    try:
+        ipaddress.ip_address(args.spoof_ip)
+    except ValueError:
+        fatal(f"--spoof-ip {args.spoof_ip!r} is not a valid IP.")
+
+    import socket as _socket
+
+    from scapy.all import AsyncSniffer, Ether, sendp
+    from scapy.layers.dot11 import Dot11, Dot11CCMP
+    from scapy.layers.l2 import ARP
+
+    from libwifi.crypto import decrypt_ccmp
+
+    from arpgtk_core.errors import IfaceError, SupplicantError
+    from arpgtk_core.iface import (detect_and_align_channel, get_iface_mac,
+                                   setup_monitor, teardown_vif)
+    from arpgtk_core.session import GtkSession, SupplicantConfig
+
+    log = lambda m: print(m, file=sys.stderr)
+
+    cfg = SupplicantConfig(
+        iface=args.iface, ssid=args.ssid, key_mgmt=args.key_mgmt,
+        psk=args.psk, sae_password=args.sae_password,
+        scan_freq=args.scan_freq, bssid=args.bssid,
+        ieee80211w=args.ieee80211w,
+    )
+
+    try:
+        we_created_mon = setup_monitor(args.iface, mon_iface)
+    except IfaceError as e:
+        fatal(str(e))
+    atexit_state["we_created_mon"] = we_created_mon
+
+    sniffer = None
+    managed_sock = None
+    stop_managed = threading.Event()
+    managed_thread = None
+    try:
+        with GtkSession(cfg, args.wpa_supplicant,
+                        debug=args.supplicant_debug,
+                        timeout=args.timeout, quiet=True) as sess:
+            keys = sess.keys
+            our_mac = get_iface_mac(args.iface).lower()
+            gtk_bytes = bytes.fromhex(keys.gtk_hex)
+            ap_mac = keys.bssid.lower()
+
+            detect_and_align_channel(args.iface, mon_iface, log=log)
+            log(f"[+] Probing for ARP defenses on {args.ssid} "
+                f"(BSSID={ap_mac}, spoofing psrc={args.spoof_ip})...")
+
+            echoed = threading.Event()
+            via = {"path": None}  # which path observed the echo first
+
+            # --- Path A: managed-iface AF_PACKET listener ----------------
+            try:
+                managed_sock = _socket.socket(
+                    _socket.AF_PACKET, _socket.SOCK_RAW,
+                    _socket.htons(_ETH_P_ARP))
+                managed_sock.bind((args.iface, _ETH_P_ARP))
+                managed_sock.settimeout(0.3)
+            except OSError as e:
+                log(f"[!] Managed-iface listener init failed: {e}; "
+                    "falling back to monitor-only detection.")
+                managed_sock = None
+
+            def managed_listen():
+                while not stop_managed.is_set():
+                    try:
+                        data, src = managed_sock.recvfrom(2048)
+                    except _socket.timeout:
+                        continue
+                    except OSError:
+                        return
+                    # Skip our own egress copy. recvfrom returns
+                    # (ifname, ethproto, pkttype, hatype, addr); pkttype
+                    # 4 == PACKET_OUTGOING.
+                    if len(src) >= 3 and src[2] == _PACKET_OUTGOING:
+                        continue
+                    if len(data) < 42 or data[12:14] != b"\x08\x06":
+                        continue
+                    arp_hdr = data[14:42]
+                    hwsrc = ":".join(f"{b:02x}" for b in arp_hdr[8:14])
+                    psrc = ".".join(str(b) for b in arp_hdr[14:18])
+                    if psrc == args.spoof_ip and hwsrc == our_mac:
+                        via["path"] = "managed"
+                        echoed.set()
+                        return
+
+            if managed_sock is not None:
+                managed_thread = threading.Thread(
+                    target=managed_listen, daemon=True)
+                managed_thread.start()
+
+            # --- Path B: monitor-iface CCMP-decrypt listener -------------
+            def on_frame(frame):
+                try:
+                    if not frame.haslayer(Dot11):
+                        return
+                    d = frame[Dot11]
+                    if d.type != 2:
+                        return
+                    if (d.FCfield & 0x03) != 0x02:
+                        return
+                    if not d.addr2 or d.addr2.lower() != ap_mac:
+                        return
+                    if (not d.addr1 or
+                            d.addr1.lower() != "ff:ff:ff:ff:ff:ff"):
+                        return
+                    if not frame.haslayer(Dot11CCMP):
+                        return
+                    try:
+                        plain = decrypt_ccmp(frame, gtk_bytes, verify=True)
+                    except Exception:
+                        return
+                    if plain is None or not plain.haslayer(ARP):
+                        return
+                    arp = plain[ARP]
+                    if (arp.psrc == args.spoof_ip and
+                            arp.hwsrc.lower() == our_mac):
+                        if not echoed.is_set():
+                            via["path"] = "monitor"
+                        echoed.set()
+                except Exception:
+                    pass
+
+            sniffer = AsyncSniffer(iface=mon_iface, prn=on_frame, store=False)
+            sniffer.start()
+
+            # Forged gratuitous ARP: "spoof_ip is at our_mac". The
+            # canonical arpspoof poison frame; if the bridge has DAI /
+            # IP-MAC binding, it gets dropped before rebroadcast.
+            forged = (Ether(src=our_mac, dst="ff:ff:ff:ff:ff:ff") /
+                      ARP(op=2, hwsrc=our_mac, psrc=args.spoof_ip,
+                          hwdst="ff:ff:ff:ff:ff:ff", pdst=args.spoof_ip))
+            for _ in range(3):
+                sendp(forged, iface=args.iface, verbose=False)
+                if echoed.wait(0.5):
+                    break
+            else:
+                echoed.wait(1.5)
+
+            # Stdout: the binary verdict, nothing else.
+            print("1" if not echoed.is_set() else "0")
+            if echoed.is_set():
+                log(f"[+] Verdict: no defense (arpspoof works) "
+                    f"-- echo seen via {via['path']} path.")
+            else:
+                log("[+] Verdict: defense present (use airspoof) -- "
+                    "no echo on managed-iface kernel RX nor on monitor.")
+            return 0
+    except (SupplicantError, IfaceError) as e:
+        fatal(str(e))
+    finally:
+        stop_managed.set()
+        if managed_sock is not None:
+            try:
+                managed_sock.close()
+            except Exception:
+                pass
+        if managed_thread is not None:
+            managed_thread.join(timeout=1.0)
+        if sniffer is not None:
+            try:
+                sniffer.stop()
+            except Exception:
+                pass
+        if we_created_mon:
+            teardown_vif(mon_iface)
+            atexit_state["we_created_mon"] = False
+            log(f"[+] Tore down {mon_iface}")
+        else:
+            log(f"[+] Leaving pre-existing {mon_iface} alone")
 
 
 def do_verify(args, *, mon_iface: str, atexit_state: dict) -> int:
@@ -579,7 +809,13 @@ def main() -> int:
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _handle)
 
+    if args.arp_defense and args.verify:
+        fatal("--arp-defense and --verify are mutually exclusive.")
+
     try:
+        if args.arp_defense:
+            return do_arp_defense(args, mon_iface=mon_iface,
+                                  atexit_state=atexit_state) or 0
         if args.verify:
             return do_verify(args, mon_iface=mon_iface,
                              atexit_state=atexit_state) or 0
