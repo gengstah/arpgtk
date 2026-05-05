@@ -21,6 +21,29 @@ def get_iface_mac(iface: str) -> str:
         return f.read().strip()
 
 
+def get_iface_phy(iface: str) -> str | None:
+    """Return the phy name (e.g. 'phy0') backing iface, or None if iface
+    isn't a Wi-Fi netdev."""
+    try:
+        return os.path.basename(
+            os.readlink(f"/sys/class/net/{iface}/phy80211"))
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def iface_is_associated(iface: str) -> bool:
+    """True if `iw <iface> link` reports an active association. Used to
+    catch ifaces NetworkManager / a stray wpa_supplicant is currently
+    holding -- spawning a second supplicant on top of one of those
+    silently corrupts the GTK comparison."""
+    try:
+        out = subprocess.check_output(["iw", iface, "link"], text=True,
+                                      stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    return "Connected to" in out
+
+
 def freq_to_channel(freq_mhz: int) -> int:
     if 2412 <= freq_mhz <= 2484:
         return 14 if freq_mhz == 2484 else (freq_mhz - 2407) // 5
@@ -131,14 +154,24 @@ def setup_monitor(phy_iface: str, mon_iface: str) -> bool:
 
 
 def setup_managed_vif(phy_iface: str, vif_name: str) -> bool:
-    """Create a second managed-mode virtual iface on the same phy as
-    phy_iface (if missing) and bring it up.
+    """Provide a second managed-mode iface for --check-gtk-shared.
 
-    Used by --check-gtk-shared to associate twice with two different MACs
-    and compare the GTKs each association receives.
+    Two ways this resolves:
 
-    Returns True if we created it, False if it already existed.
-    Raises IfaceError on failure.
+      1. vif_name is an existing managed netdev (a separate physical NIC,
+         or a vif a previous run left behind) -- reused as-is, no
+         creation. The iface must be idle: if it's currently associated
+         to an AP (NetworkManager, a stray wpa_supplicant), we refuse,
+         because spawning our own supplicant on top of a held iface
+         silently corrupts the comparison.
+      2. vif_name doesn't exist -- created on phy_iface as a virtual
+         managed iface on the same phy, then brought up. Some chipsets
+         (rt2800usb, most Realtek RTLxxx, Intel iwlwifi) reject this
+         silently; we detect the gap and tell the operator to use a
+         second physical NIC instead.
+
+    Returns True if we created the iface, False if we reused an existing
+    one. Raises IfaceError on any failure mode.
     """
     validate_iface_name(vif_name)
     if iface_exists(vif_name):
@@ -148,6 +181,15 @@ def setup_managed_vif(phy_iface: str, vif_name: str) -> bool:
                 f"{vif_name} already exists but is not in managed mode. "
                 f"Pick a different --chk-iface or remove it first "
                 f"(`iw dev {vif_name} del`).")
+        if iface_is_associated(vif_name):
+            raise IfaceError(
+                f"{vif_name} is currently associated to a Wi-Fi network "
+                "(NetworkManager or another wpa_supplicant is holding it). "
+                "--check-gtk-shared needs an idle iface so it can drive a "
+                "fresh association and capture a clean GTK. Disconnect "
+                f"first: `nmcli dev disconnect {vif_name}` (or "
+                f"`nmcli dev set {vif_name} managed no` to keep NM out of "
+                "it for the rest of the session), then re-run.")
         subprocess.check_call(["ip", "link", "set", vif_name, "up"])
         return False
     try:

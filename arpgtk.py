@@ -90,8 +90,16 @@ def parse_args() -> argparse.Namespace:
                    help="Auto-created monitor iface (default: "
                         "<iface>[:12]+'mon'). Only used by --verify.")
     g.add_argument("--chk-iface",
-                   help="Auto-created second managed iface for "
-                        "--check-gtk-shared (default: <iface>[:12]+'chk').")
+                   help="Second managed iface for --check-gtk-shared. "
+                        "Pass an existing physical NIC's name (e.g. "
+                        "wlan1) to do the comparison across two cards "
+                        "-- the most reliable setup, and the workaround "
+                        "for chipsets that won't host two managed vifs "
+                        "on one phy (rt2800usb, most Realtek/Intel). "
+                        "Iface must be idle (disconnect from any AP "
+                        "first). If left unset (default: "
+                        "<iface>[:12]+'chk') we auto-create a virtual "
+                        "managed iface on the same phy as --iface.")
     g.add_argument("--ssid", required=True, help="Target SSID.")
     g.add_argument("--key-mgmt", default="WPA-PSK",
                    help="WPA-PSK | SAE | NONE (default WPA-PSK).")
@@ -196,8 +204,8 @@ def do_check_gtk_shared(args, *, iface_a: str, chk_iface: str,
                        atexit_state: dict) -> str:
     """Run two parallel associations and byte-compare GTKs."""
     from arpgtk_core.errors import IfaceError, SupplicantError
-    from arpgtk_core.iface import (get_iface_mac, setup_managed_vif,
-                                   teardown_vif)
+    from arpgtk_core.iface import (get_iface_mac, get_iface_phy,
+                                   setup_managed_vif, teardown_vif)
     from arpgtk_core.session import GtkSession, SupplicantConfig
 
     try:
@@ -207,8 +215,16 @@ def do_check_gtk_shared(args, *, iface_a: str, chk_iface: str,
         return "inconclusive"
     atexit_state["we_created_chk"] = created
 
-    print(f"[+] Comparison iface: {chk_iface} "
-          f"({'auto-created' if created else 'reusing existing'})")
+    if created:
+        kind = "auto-created vif on same phy"
+    else:
+        phy_a = get_iface_phy(iface_a)
+        phy_b = get_iface_phy(chk_iface)
+        if phy_a and phy_b and phy_a != phy_b:
+            kind = f"reusing separate physical NIC ({phy_b} vs {phy_a})"
+        else:
+            kind = "reusing existing iface on same phy"
+    print(f"[+] Comparison iface: {chk_iface} ({kind})")
 
     cfg_a = SupplicantConfig(
         iface=iface_a, ssid=args.ssid, key_mgmt=args.key_mgmt,
